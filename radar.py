@@ -116,7 +116,7 @@ def parse(raw,ctype,base,source):
   if end and end<NOW().date().isoformat():expired+=1;continue
   s,tr=rank(title,desc)
   if not s:rejected.append(title)
-  if s:jobs.append(dict(title=html.unescape(title),url=canonical(url),source=source,score=s,track=tr,deadline=end,last_seen=NOW().isoformat(),retained=False))
+  if s:jobs.append(dict(title=html.unescape(title),url=canonical(url),source=source,score=s,track=tr,deadline=end,description=desc,last_seen=NOW().isoformat(),retained=False))
  return jobs,dict(format=mode,parsed=len(rows),expired=expired,rejected=rejected[:10]),feeds
 
 def request(url):
@@ -134,35 +134,81 @@ def permitted(url):
  except urllib.error.HTTPError as e:
   if e.code!=404:raise
 
+def oracle_payload(payload,name,base):
+ # Read only JSON responses emitted by the public career page itself.
+ rows=[]
+ def walk(obj):
+  if isinstance(obj,dict):
+   title=obj.get('Title') or obj.get('title')
+   ident=obj.get('Id') or obj.get('RequisitionId')
+   if isinstance(title,str) and ident is not None and str(ident).isdigit():
+    prefix=base.split('/jobs')[0]
+    link=obj.get('ExternalUrl') or obj.get('JobUrl') or prefix+'/job/'+str(ident)
+    if safe_url(link):
+     desc=' '.join(str(obj.get(k) or '') for k in ['ShortDescriptionStr','ExternalQualificationsStr','ExternalResponsibilitiesStr','PrimaryLocation'])
+     end=str(obj.get('PostingEndDate') or '')[:10]
+     if not re.fullmatch(r'\d{4}-\d{2}-\d{2}',end):end=deadline(desc)
+     score,track=rank(title,desc)
+     if score and (not end or end>=NOW().date().isoformat()):rows.append(dict(title=title,url=canonical(link),source=name,score=score,track=track,deadline=end,description=desc,last_seen=NOW().isoformat(),retained=False))
+   for v in obj.values():walk(v)
+  elif isinstance(obj,list):
+   for v in obj:walk(v)
+ walk(payload)
+ return rows
+
 def oracle_run(name,url):
- # Render the public career page, without guessing private API endpoints.
+ diagnostic=Path('site/diagnostics');diagnostic.mkdir(parents=True,exist_ok=True)
+ notes=[];captured=[]
  try:
   permitted(url)
   from playwright.sync_api import sync_playwright
   with sync_playwright() as pw:
    browser=pw.chromium.launch(headless=True)
    try:
-    page=browser.new_page(user_agent='DamirJobRadar/15 public vacancy reader')
-    response=page.goto(url,wait_until='domcontentloaded',timeout=45000)
+    page=browser.new_page()  # standard browser UA, not an invented crawler UA
+    def observe(response):
+     if urllib.parse.urlsplit(response.url).netloc!=urllib.parse.urlsplit(url).netloc:return
+     if 'recruitingCEJobRequisitions' not in response.url:return
+     try:
+      if response.ok:captured.extend(oracle_payload(response.json(),name,url))
+     except Exception as e:notes.append(type(e).__name__)
+    page.on('response',observe)
+    response=page.goto(url,wait_until='domcontentloaded',timeout=60000)
     if response and response.status>=400:raise ValueError(f'Career page HTTP {response.status}')
-    page.wait_for_function("() => Array.from(document.querySelectorAll('a[href]')).some(a => /\\/(jobs\\/preview|job)\\/\\d+/.test(a.getAttribute('href')))",timeout=30000)
-    pattern=PATTERNS[name];previous=-1
+    page.wait_for_timeout(8000)
+    # Inspect links in every frame. No fixed site-ID path assumption.
+    found={};previous=-1
     for _ in range(8):
-     content=page.content()
-     if re.search(r'captcha|verify you are human|access denied',content[:6000],re.I):raise PermissionError('Access challenge; not bypassed')
-     count=len(re.findall(pattern,content,re.I))
-     if count==previous:break
-     previous=count
+     for frame in page.frames:
+      try:
+       content=frame.content()
+       if re.search(r'captcha|verify you are human|access denied',content[:6000],re.I):raise PermissionError('Access challenge; not bypassed')
+       links=frame.locator('a[href]').evaluate_all('(xs)=>xs.map(a=>({href:a.href,title:a.innerText||a.getAttribute("aria-label")||""}))')
+       for link in links:
+        u=link['href'];title=link['title'].strip()
+        if not safe_url(u) or not re.search(r'/(?:jobs/preview|job)/\d+',urllib.parse.urlsplit(u).path):continue
+        score,track=rank(title,'')
+        if score:found[u]=dict(title=title,url=canonical(u),source=name,score=score,track=track,deadline=None,description='',last_seen=NOW().isoformat(),retained=False)
+      except PermissionError:raise
+      except Exception as e:notes.append(type(e).__name__)
+     for job in captured:found[job['url']]=job
+     if len(found)==previous:break
+     previous=len(found)
      buttons=page.get_by_role('button',name=re.compile(r'show more|load more',re.I))
      if buttons.count() and buttons.first.is_visible():buttons.first.click(timeout=5000)
      else:page.evaluate('window.scrollTo(0,document.body.scrollHeight)')
-     page.wait_for_timeout(1800)
-    raw=page.content().encode('utf-8')
-    jobs,info,_=parse(raw,'text/html',page.url,name)
-    if not info['parsed']:raise ValueError('Rendered page has no recognized vacancy links; adapter requires inspection')
-    return name,jobs,dict(ok=True,message=f"Rendered HTML: {info['parsed']} records, {len(jobs)} matches (bounded page coverage)",rejected_examples=info['rejected'])
+     page.wait_for_timeout(2500)
+    # Public listing diagnostics only; no cookies, tokens, headers or network bodies saved.
+    report=dict(final_url=page.url,title=page.title(),frames=len(page.frames),captured_matches=len(captured),matched_links=len(found),public_links=page.locator('a[href]').evaluate_all('(xs)=>xs.slice(0,30).map(a=>({href:a.href,title:a.innerText}))'),notes=notes[:10])
+    (diagnostic/(name+'.json')).write_text(json.dumps(report,indent=2))
+    try:page.screenshot(path=str(diagnostic/(name+'.png')),full_page=False)
+    except Exception as e:notes.append('screenshot: '+type(e).__name__)
+    if not found:raise ValueError('No relevant records extracted; see diagnostics/'+name+'.json and .png. Not proof of no vacancies.')
+    return name,list(found.values()),dict(ok=True,message=f'Public page: {len(found)} matching records; bounded coverage; diagnostics saved')
    finally:browser.close()
- except Exception as e:return name,[],dict(ok=False,message=f'{type(e).__name__}: {str(e)[:220]}')
+ except Exception as e:
+  (diagnostic/(name+'-error.txt')).write_text(type(e).__name__+': '+str(e)[:500])
+  return name,[],dict(ok=False,message=f'{type(e).__name__}: {str(e)[:220]}')
 
 def source_run(pair):
  name,urls=pair;attempts=[]
@@ -179,6 +225,27 @@ def source_run(pair):
   except Exception as e:attempts.append(f'{url}: {type(e).__name__}: {str(e)[:160]}')
  return name,[],dict(ok=False,message=' | '.join(attempts))
 
+ELIGIBILITY_WEIGHTS={'deadline':20,'external_access':20,'education':20,'experience':20,'work_rights':15,'language':5}
+def assess(job):
+ title=job.get('title','');desc=job.get('description','');text=norm(title+' '+desc)
+ checks={k:dict(status='UNKNOWN',evidence='Not established from available vacancy/profile evidence') for k in ELIGIBILITY_WEIGHTS}
+ def setcheck(k,status,evidence):checks[k]=dict(status=status,evidence=evidence)
+ end=job.get('deadline')
+ if end:setcheck('deadline','PASS' if end>=NOW().date().isoformat() else 'FAIL','Explicit closing date: '+end)
+ if any(has(title,x) for x in ['open to all applicants','open to internal and external applicants','open to internal and external candidates','open to external applicants']):setcheck('external_access','PASS','External applicants explicitly included in title')
+ if any(has(title,x) for x in ['internal candidates only','internal applicants only']) or re.search(r'open to tiers? [012 and]+ applicants',norm(title)) and not has(title,'external'):setcheck('external_access','FAIL','Internal-only restriction in title')
+ # Only narrowly matched mandatory requirements, not inferred from job title.
+ if re.search(r'(?:bachelor|master|degree).{0,60}(?:architecture|architectural engineering)',text):setcheck('education','PASS','Architecture/architectural-engineering degree wording; confirmed profile degrees. Check equivalence and additional conditions.')
+ years=re.search(r'(?:minimum of|at least) (\d+) years? (?:of )?(?:relevant |professional )?experience',text)
+ if years and int(years[1])<=2:setcheck('experience','PASS','Explicit minimum <=2 years; confirmed construction assignment September 2024-September 2026. Relevance still requires review.')
+ # Native language is confirmed; English/French/Italian proficiency levels are not.
+ if re.search(r'(?:fluency|fluent|native).{0,35}(?:bosnian|croatian|serbian)',text):setcheck('language','PASS','Bosnian/Croatian/Serbian: Native confirmed')
+ if job.get('retained'):setcheck('deadline','UNKNOWN','Retained listing: current availability not rechecked')
+ passed=sum(ELIGIBILITY_WEIGHTS[k] for k,v in checks.items() if v['status']=='PASS')
+ failed=any(v['status']=='FAIL' for v in checks.values())
+ unknown=any(v['status']=='UNKNOWN' for v in checks.values())
+ return dict(score=passed,status='INELIGIBLE' if failed else 'NEEDS VERIFICATION' if unknown else 'CHECKED CRITERIA PASS',checks=checks)
+
 def merge(old,results):
  previous={j['url']:j for j in old.get('jobs',[]) if safe_url(j.get('url',''))};out={};health={}
  for name,jobs,status in results:
@@ -192,11 +259,12 @@ def merge(old,results):
     if age>dt.timedelta(days=7) or (j.get('deadline') and j['deadline']<NOW().date().isoformat()):continue
     jobs.append(dict(j,retained=True))
   for j in jobs:out.setdefault(j['url'],dict(j,new=j['url'] not in previous))
- return dict(updated=NOW().isoformat(),jobs=sorted(out.values(),key=lambda j:(-j['score'],j['title'])),sources=health)
+ for j in out.values():j['eligibility']=assess(j)
+ return dict(updated=NOW().isoformat(),jobs=sorted(out.values(),key=lambda j:(j['eligibility']['status']=='INELIGIBLE',-j['eligibility']['score'],-j['score'],j['title'])),sources=health)
 
-PAGE=r"""<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Damir Job Radar V15</title><style>body{font:16px system-ui;max-width:1000px;margin:30px auto;padding:16px;background:#eef3f6;color:#123}header{background:#153b50;color:white;padding:24px;border-radius:14px}article,details{background:white;padding:18px;margin:12px 0;border-radius:10px}input,select,button{padding:12px;margin:10px 6px 10px 0}a{color:#075b9b}.warning{background:#fff0bf;padding:16px}</style><header><h1>Damir's Job Radar</h1><p>Construction · Infrastructure · WASH · Contracts · Facilities · Architecture</p></header><p id=status>Waiting for results...</p><input id=q placeholder="Search title or source" aria-label=Search><select id=track aria-label=Track><option value="">All tracks</option></select><button id=refresh>Refresh</button><main id=jobs></main><details open><summary>Source health</summary><ul id=health></ul></details><details><summary>Other ways to find jobs</summary><p>These are manual search links, NOT automatically collected results.</p><ul id=manual></ul></details><p>Priority is a keyword ranking, not an eligibility score. Check deadlines and work rights. Retained jobs are at most seven days old and may have closed. No AI, email or paid API.</p><script>
+PAGE=r"""<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Damir Job Radar V15</title><style>body{font:16px system-ui;max-width:1000px;margin:30px auto;padding:16px;background:#eef3f6;color:#123}header{background:#153b50;color:white;padding:24px;border-radius:14px}article,details{background:white;padding:18px;margin:12px 0;border-radius:10px}input,select,button{padding:12px;margin:10px 6px 10px 0}a{color:#075b9b}.warning{background:#fff0bf;padding:16px}</style><header><h1>Damir's Job Radar</h1><p>Construction · Infrastructure · WASH · Contracts · Facilities · Architecture</p></header><p id=status>Waiting for results...</p><input id=q placeholder="Search title or source" aria-label=Search><select id=track aria-label=Track><option value="">All tracks</option></select><button id=refresh>Refresh</button><main id=jobs></main><details open><summary>Source health</summary><ul id=health></ul></details><details><summary>Other ways to find jobs</summary><p>These are manual search links, NOT automatically collected results.</p><ul id=manual></ul></details><p>Ranked by confirmed eligibility evidence, not a hiring probability. Unknown criteria earn no points and remain visible. Nationality/work rights are not assumed. Expired known dates are removed; retained results are marked unverified. No AI, email or paid API.</p><script>
 const data=__DATA__,el=id=>document.getElementById(id);
-function render(){el('jobs').replaceChildren();let n=0;for(const j of data.jobs){if(el('track').value&&j.track!==el('track').value)continue;if(![j.title,j.source,j.track].join(' ').toLowerCase().includes(el('q').value.toLowerCase()))continue;let u;try{u=new URL(j.url);if(!['http:','https:'].includes(u.protocol))continue}catch{continue}const a=document.createElement('a'),h=document.createElement('h2'),p=document.createElement('p'),card=document.createElement('article');a.href=u.href;a.target='_blank';a.rel='noopener noreferrer';a.textContent=j.title;h.append(a);p.textContent=`${j.source} | ${j.track} | Priority ${j.score} | ${j.retained?'RETAINED, source unavailable':j.new?'NEW':'Seen before'} | Deadline: ${j.deadline||'not verified'}`;card.append(h,p);el('jobs').append(card);n++}if(!n){const p=document.createElement('p');p.className='warning';p.textContent='No matching jobs. Check source health and manual search links. This is not proof that no vacancies exist.';el('jobs').append(p)}}
+function render(){el('jobs').replaceChildren();let n=0;for(const j of data.jobs){if(el('track').value&&j.track!==el('track').value)continue;if(![j.title,j.source,j.track].join(' ').toLowerCase().includes(el('q').value.toLowerCase()))continue;let u;try{u=new URL(j.url);if(!['http:','https:'].includes(u.protocol))continue}catch{continue}const a=document.createElement('a'),h=document.createElement('h2'),p=document.createElement('p'),card=document.createElement('article');a.href=u.href;a.target='_blank';a.rel='noopener noreferrer';a.textContent=j.title;h.append(a);p.textContent=`${j.source} | ${j.track} | Eligibility evidence ${j.eligibility?j.eligibility.score:0}/100 (${j.eligibility?j.eligibility.status:'NEEDS VERIFICATION'}) | ${j.retained?'RETAINED, source unavailable':j.new?'NEW':'Seen before'} | Deadline: ${j.deadline||'not verified'}`;card.append(h,p);if(j.eligibility){const details=document.createElement('details'),sum=document.createElement('summary');sum.textContent='Eligibility checks and evidence';details.append(sum);for(const [key,c]of Object.entries(j.eligibility.checks)){const line=document.createElement('p');line.textContent=key+': '+c.status+' — '+c.evidence;details.append(line)}card.append(details)}el('jobs').append(card);n++}if(!n){const p=document.createElement('p');p.className='warning';p.textContent='No matching jobs. Check source health and manual search links. This is not proof that no vacancies exist.';el('jobs').append(p)}}
 el('status').textContent=`Updated ${data.updated} | ${data.jobs.length} results | ${Object.values(data.sources).filter(s=>s.ok).length}/${Object.keys(data.sources).length} sources responding`;
 for(const [name,s]of Object.entries(data.sources)){const li=document.createElement('li');li.textContent=`${name}: ${s.ok?'OK':'UNAVAILABLE'} - ${s.message}${s.rejected_examples&&s.rejected_examples.length?' | Rejected examples: '+s.rejected_examples.join('; '):''}`;el('health').append(li)}
 for(const t of [...new Set(data.jobs.map(j=>j.track))].sort())el('track').add(new Option(t,t));
@@ -221,6 +289,18 @@ def run():
  print(summary)
 
 class Tests(unittest.TestCase):
+ def test_eligibility_unknown(self):
+  a=assess({'title':'Civil Engineer'});self.assertEqual(a['score'],0);self.assertEqual(a['status'],'NEEDS VERIFICATION')
+ def test_no_work_rights_inference(self):self.assertEqual(assess({'title':'Civil Engineer Sarajevo'})['checks']['work_rights']['status'],'UNKNOWN')
+ def test_eligibility_deadline(self):self.assertEqual(assess({'deadline':'2001-01-01'})['status'],'INELIGIBLE')
+ def test_external_evidence(self):self.assertEqual(assess({'title':'Civil Engineer Open to internal and external applicants'})['score'],20)
+ def test_retained_unknown(self):self.assertEqual(assess({'deadline':'2099-01-01','retained':True})['checks']['deadline']['status'],'UNKNOWN')
+ def test_oracle_payload(self):
+  x={'items':[{'requisitionList':[{'Id':'123','Title':'Civil Engineer','PostingEndDate':'2099-01-01'}]}]}
+  self.assertEqual(len(oracle_payload(x,'UNDP',ORACLE['UNDP'])),1)
+ def test_oracle_expired(self):
+  self.assertEqual(oracle_payload({'Id':'123','Title':'Civil Engineer','PostingEndDate':'2001-01-01'},'UNDP',ORACLE['UNDP']),[])
+
  def test_procurement_nonworks(self):self.assertEqual(rank('Procurement Officer','vaccines')[0],0)
  def test_procurement_works(self):self.assertGreater(rank('Procurement Officer','civil works')[0],0)
  def test_tier3_allowed(self):self.assertGreater(rank('Civil Engineer Open to Tier 1 2 3 applicants','')[0],0)
